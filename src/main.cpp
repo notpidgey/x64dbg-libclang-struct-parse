@@ -14,12 +14,12 @@
 #include <clang-c/Index.h>
 #include <nlohmann/json.hpp>
 
-#include "default.h"
-
-nlohmann::json enum_objects;
-nlohmann::json struct_objects;
-nlohmann::json union_objects;
-nlohmann::json type_objects;
+enum json_category {
+    ENUM_TYPE = 0,
+    STRUCT_TYPE = 1,
+    UNION_TYPE = 2,
+    TYPEDEF_TYPE = 3,
+};
 
 struct CXTypeHash {
     std::size_t operator()(const CXType &t) const noexcept {
@@ -39,17 +39,17 @@ struct CXTypeEqual {
 
 uint32_t anonymous_type_counter = 0;
 std::unordered_map<CXType, std::string, CXTypeHash, CXTypeEqual> anonymous_type_map;
-std::unordered_set<CXType, CXTypeHash, CXTypeEqual> declared_types;
+std::unordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash, CXTypeEqual> declared_types;
 
 bool type_declared(const CXType &field_type) {
     return declared_types.contains(field_type);
 }
 
-void insert_type_declared(const CXType &field_type) {
-    declared_types.insert(field_type);
+void insert_type_declared(const CXType &field_type, const nlohmann::json &json, json_category cat) {
+    declared_types[field_type] = {json, cat};
 }
 
-void create_anon_type_name(const CXType& str) {
+void create_anon_type_name(const CXType &str) {
     const CXCursor decl_cursor = clang_getTypeDeclaration(str);
     assert(clang_Cursor_isAnonymous(decl_cursor), "type is not anonymous");
 
@@ -60,16 +60,16 @@ void create_anon_type_name(const CXType& str) {
     switch (clang_getCursorKind(decl_cursor)) {
         case CXCursor_StructDecl:
             prefix_name = "struct";
-        break;
+            break;
         case CXCursor_ClassDecl:
             prefix_name = "class";
-        break;
+            break;
         case CXCursor_UnionDecl:
             prefix_name = "union";
-        break;
+            break;
         case CXCursor_EnumDecl:
             prefix_name = "enum";
-        break;
+            break;
     }
 
     const auto anon_type_name = std::format("__anonymous_{}{}", prefix_name, ++anonymous_type_counter);
@@ -85,31 +85,7 @@ const char *try_get_anon_name(const CXType &str) {
 };
 
 nlohmann::json &get_type_json(const CXType &type) {
-    const auto normalized_spelling = try_get_anon_name(type);
-    for (auto &t: struct_objects) {
-        if (t.contains("name")) {
-            if (t["name"] == normalized_spelling)
-                return t;
-        }
-    }
-
-    for (auto &t: union_objects) {
-        if (t.contains("name")) {
-            if (t["name"] == normalized_spelling)
-                return t;
-        }
-    }
-
-    for (auto &t: enum_objects) {
-        if (t.contains("name")) {
-            if (t["name"] == normalized_spelling)
-                return t;
-        }
-    }
-
-    __debugbreak();
-    nlohmann::json t;
-    return t;
+    return std::get<0>(declared_types[type]);
 }
 
 // removed the prefix "struct", "union", "enum", and "class"
@@ -138,9 +114,8 @@ std::string normalize_field_type_name(const CXType &type, const uint32_t pointer
             kind == CXCursor_ClassDecl ||
             kind == CXCursor_UnionDecl ||
             kind == CXCursor_EnumDecl) {
-
             if (clang_Cursor_isAnonymous(decl_cursor)) {
-                 create_anon_type_name(current_type);
+                create_anon_type_name(current_type);
             }
         }
     }
@@ -159,16 +134,13 @@ RETURN_SPELLING:
 };
 
 CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _2) {
-    auto handle_container_decl = [](const CXCursor &target_cursor, const CXCursorKind target_kind, const char *name,
-                                    nlohmann::json &struct_objects) {
+    auto handle_container_decl = [](const CXCursor &target_cursor, const json_category cat) {
         nlohmann::json struct_decl;
 
         const CXType field_type = clang_getCursorType(target_cursor);
         if (clang_equalCursors(clang_getCursorDefinition(target_cursor), clang_getNullCursor()) ||
             type_declared(field_type))
             return;
-
-        insert_type_declared(field_type);
 
         std::string type_name;
         const auto spelling = clang_getTypeSpelling(field_type);
@@ -184,10 +156,10 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
         struct_decl["name"] = type_name;
         struct_decl["members"] = {};
 
-        if (target_kind == CXCursor_UnionDecl)
+        if (cat == UNION_TYPE)
             struct_decl["isUnion"] = true;
 
-        if (target_kind == CXCursor_EnumDecl) {
+        if (cat == ENUM_TYPE) {
             const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
             auto size = clang_Type_getSizeOf(underlying_type);
 
@@ -195,19 +167,19 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
             struct_decl["isBitField"] = true;
         }
 
-        struct_objects.push_back(struct_decl);
+        insert_type_declared(field_type, struct_decl, cat);
         clang_disposeString(spelling);
     };
 
     switch (const auto cursor_kind = clang_getCursorKind(cursor)) {
         case CXCursor_StructDecl:
-            handle_container_decl(cursor, CXCursor_StructDecl, "struct", struct_objects);
+            handle_container_decl(cursor, STRUCT_TYPE);
             break;
         case CXCursor_UnionDecl:
-            handle_container_decl(cursor, CXCursor_UnionDecl, "union", union_objects);
+            handle_container_decl(cursor, UNION_TYPE);
             break;
         case CXCursor_EnumDecl:
-            handle_container_decl(cursor, CXCursor_EnumDecl, "enum", enum_objects);
+            handle_container_decl(cursor, ENUM_TYPE);
             break;
 
         case CXCursor_EnumConstantDecl: {
@@ -280,8 +252,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
                 type_info["name"] = name;
                 type_info["type"] = type;
 
-                type_objects.push_back(type_info);
-                insert_type_declared(clang_getCursorType(cursor));
+                insert_type_declared(clang_getCursorType(cursor), type_info, TYPEDEF_TYPE);
             }
 
             clang_disposeString(typedef_name);
@@ -330,7 +301,6 @@ int main(const int argc, char **argv) {
 
     include_stub.close();
 
-
     if (const auto index = clang_createIndex(0, 1)) {
         CXTranslationUnit tu = nullptr;
         const auto error = clang_parseTranslationUnit2(
@@ -356,10 +326,28 @@ int main(const int argc, char **argv) {
     }
 
     nlohmann::json root_type_object;
-    root_type_object["structs"] = struct_objects;
-    root_type_object["unions"] = union_objects;
-    root_type_object["types"] = type_objects;
-    root_type_object["enums"] = enum_objects;
+    root_type_object["structs"] = {};
+    root_type_object["unions"] = {};
+    root_type_object["types"] = {};
+    root_type_object["enums"] = {};
+
+    for (auto &val: declared_types | std::views::values) {
+        auto &[body, type] = val;
+        switch (type) {
+            case ENUM_TYPE:
+                root_type_object["enums"].push_back(body);
+                break;
+            case STRUCT_TYPE:
+                root_type_object["structs"].push_back(body);
+                break;
+            case UNION_TYPE:
+                root_type_object["unions"].push_back(body);
+                break;
+            case TYPEDEF_TYPE:
+                root_type_object["types"].push_back(body);
+                break;
+        }
+    }
 
     std::ofstream out("phnt_x64.json", std::ios::trunc);
     out << root_type_object.dump(4) << std::endl;
