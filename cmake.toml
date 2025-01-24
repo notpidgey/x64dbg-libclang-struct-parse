@@ -1,0 +1,14 @@
+[project]
+name = "libclang-struct-parse"
+
+[target.libclang]
+type = "interface"
+include-directories = ["extern/include"]
+link-libraries = ["extern/lib/libclang.lib"]
+
+[target.libclang-struct-parse]
+type = "executable"
+sources = ["src/*"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["::libclang"]
+include-directories = ["include"]
