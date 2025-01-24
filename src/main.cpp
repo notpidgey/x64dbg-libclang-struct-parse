@@ -292,7 +292,11 @@ int main(const int argc, char **argv) {
         c_args.push_back(arg.c_str());
 
     const std::vector<std::string> target_headers = {
-        "Windows.h"
+        "Windows.h",
+
+        // include any other headers which you want parsed
+        // you can copy phnt into the build path
+        "phnt.h"
     };
 
     std::ofstream include_stub(stub_source, std::ios::out | std::ios::trunc);
@@ -349,7 +353,7 @@ int main(const int argc, char **argv) {
         }
     }
 
-    std::ofstream out("phnt_x64.json", std::ios::trunc);
+    std::ofstream out("windows_types_x64.json", std::ios::trunc);
     out << root_type_object.dump(4) << std::endl;
 
     return EXIT_SUCCESS;
