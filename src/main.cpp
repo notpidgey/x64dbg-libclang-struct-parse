@@ -1,3 +1,5 @@
+#include <tsl/ordered_map.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -39,7 +41,8 @@ struct CXTypeEqual {
 
 uint32_t anonymous_type_counter = 0;
 std::unordered_map<CXType, std::string, CXTypeHash, CXTypeEqual> anonymous_type_map;
-std::unordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash, CXTypeEqual> declared_types;
+
+tsl::ordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash, CXTypeEqual> declared_types;
 
 bool type_declared(const CXType &field_type) {
     return declared_types.contains(field_type);
@@ -47,6 +50,17 @@ bool type_declared(const CXType &field_type) {
 
 void insert_type_declared(const CXType &field_type, const nlohmann::json &json, json_category cat) {
     declared_types[field_type] = {json, cat};
+}
+
+void float_type_declared(const CXType &field_type) {
+    const auto value = declared_types[field_type];
+    declared_types.erase(field_type);
+
+    declared_types[field_type] = value;
+}
+
+void remove_type_declaration(const CXType& field_type) {
+    declared_types.erase(field_type);
 }
 
 void create_anon_type_name(const CXType &str) {
@@ -137,18 +151,18 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
     auto handle_container_decl = [](const CXCursor &target_cursor, const json_category cat) {
         nlohmann::json struct_decl;
 
-        const CXType field_type = clang_getCursorType(target_cursor);
+        const CXType structure_type = clang_getCursorType(target_cursor);
         if (clang_equalCursors(clang_getCursorDefinition(target_cursor), clang_getNullCursor()) ||
-            type_declared(field_type))
+            type_declared(structure_type))
             return;
 
         std::string type_name;
-        const auto spelling = clang_getTypeSpelling(field_type);
+        const auto spelling = clang_getTypeSpelling(structure_type);
         if (clang_Cursor_isAnonymousRecordDecl(target_cursor) || clang_Cursor_isAnonymous(target_cursor)) {
-            if (!try_get_anon_name(field_type))
-                create_anon_type_name(field_type);
+            if (!try_get_anon_name(structure_type))
+                create_anon_type_name(structure_type);
 
-            type_name = try_get_anon_name(field_type);
+            type_name = try_get_anon_name(structure_type);
         } else {
             type_name = std::string(clang_getCString(spelling));
         }
@@ -156,31 +170,41 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
         struct_decl["name"] = type_name;
         struct_decl["members"] = {};
 
+        if (type_name == "_RTL_BALANCED_NODE")
+            __debugbreak();
+
         if (cat == UNION_TYPE)
             struct_decl["isUnion"] = true;
 
         if (cat == ENUM_TYPE) {
             const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
-            auto size = clang_Type_getSizeOf(underlying_type);
+            auto size = clang_Type_getSizeOf(underlying_type) * 8;
 
             struct_decl["size"] = size;
             struct_decl["isBitField"] = true;
         }
 
-        insert_type_declared(field_type, struct_decl, cat);
+        insert_type_declared(structure_type, struct_decl, cat);
+        clang_visitChildren(target_cursor, visit_cursor, nullptr);
+
+        if (!get_type_json(structure_type)["members"].empty())
+            float_type_declared(structure_type);
+        else
+            remove_type_declaration(structure_type);
+
         clang_disposeString(spelling);
     };
 
     switch (const auto cursor_kind = clang_getCursorKind(cursor)) {
         case CXCursor_StructDecl:
             handle_container_decl(cursor, STRUCT_TYPE);
-            break;
+            return CXChildVisit_Continue;
         case CXCursor_UnionDecl:
             handle_container_decl(cursor, UNION_TYPE);
-            break;
+            return CXChildVisit_Continue;
         case CXCursor_EnumDecl:
             handle_container_decl(cursor, ENUM_TYPE);
-            break;
+            return CXChildVisit_Continue;
 
         case CXCursor_EnumConstantDecl: {
             const CXCursorKind parent_kind = clang_getCursorKind(parent);
@@ -211,8 +235,10 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
                 "parent is not struct/class declaration");
 
             const CXType parent_type = clang_getCursorType(parent);
-            nlohmann::json &parent_structure = get_type_json(parent_type);
+            if (!type_declared(parent_type))
+                clang_visitChildren(cursor, visit_cursor, nullptr);
 
+            nlohmann::json &parent_structure = get_type_json(parent_type);
             auto &members = parent_structure["members"];
 
             const CXString name = clang_getCursorSpelling(cursor);
@@ -222,6 +248,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
             if (!parent_structure.contains("isUnion")) {
                 const auto bit_offset = clang_Cursor_getOffsetOfField(cursor);
                 member_info["offset"] = bit_offset / 8;
+
                 if (clang_Cursor_isBitField(cursor)) {
                     member_info["bitOffset"] = bit_offset % 8;
                     member_info["bitSize"] = clang_getFieldDeclBitWidth(cursor);
@@ -259,7 +286,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
         }
 
         case CXCursor_ClassTemplate: {
-            return CXChildVisit_Continue;
+            // return CXChildVisit_Continue;
         }
     }
 
@@ -282,6 +309,7 @@ int main(const int argc, char **argv) {
         // "-I" + std::string(argv[1]),
         "-x", "c++",
         "-target x86_64-windows-msvc",
+        "-fms-extensions",
         "-Xclang",
         "-ast-dump",
         "-fsyntax-only",
@@ -292,10 +320,6 @@ int main(const int argc, char **argv) {
         c_args.push_back(arg.c_str());
 
     const std::vector<std::string> target_headers = {
-        "Windows.h",
-
-        // include any other headers which you want parsed
-        // you can copy phnt into the build path
         "phnt.h"
     };
 
@@ -329,6 +353,27 @@ int main(const int argc, char **argv) {
         clang_disposeTranslationUnit(tu);
     }
 
+    // std::vector<std::string> decl_order;
+    // std::unordered_map<std::string, std::pair<json_category, nlohmann::json *> > name_mapping;
+    //
+    // for (auto &val: declared_types | std::views::values) {
+    //     auto &[body, type] = val;
+    //     switch (type) {
+    //         case UNION_TYPE:
+    //         case STRUCT_TYPE:
+    //             name_mapping[body["name"]] = {type, &body};
+    //             break;
+    //     }
+    // }
+    //
+    // auto dfs = [](nlohmann::json *val) {
+    //     auto json_val = *val;
+    //     auto members = json_val["members"];
+    //
+    //     for (nlohmann::json member: members) {
+    //     }
+    // };
+
     nlohmann::json root_type_object;
     root_type_object["structs"] = {};
     root_type_object["unions"] = {};
@@ -342,10 +387,8 @@ int main(const int argc, char **argv) {
                 root_type_object["enums"].push_back(body);
                 break;
             case STRUCT_TYPE:
-                root_type_object["structs"].push_back(body);
-                break;
             case UNION_TYPE:
-                root_type_object["unions"].push_back(body);
+                root_type_object["structUnions"].push_back(body);
                 break;
             case TYPEDEF_TYPE:
                 root_type_object["types"].push_back(body);
