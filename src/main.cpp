@@ -170,8 +170,8 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
         struct_decl["name"] = type_name;
         struct_decl["members"] = {};
 
-        if (type_name == "_RTL_BALANCED_NODE")
-            __debugbreak();
+        // if (type_name == "_RTL_BALANCED_NODE")
+        //     __debugbreak();
 
         if (cat == UNION_TYPE)
             struct_decl["isUnion"] = true;
