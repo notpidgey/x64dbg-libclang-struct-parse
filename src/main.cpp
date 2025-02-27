@@ -21,6 +21,7 @@ enum json_category {
     STRUCT_TYPE = 1,
     UNION_TYPE = 2,
     TYPEDEF_TYPE = 3,
+    FUNCTION_TYPE = 4
 };
 
 struct CXTypeHash {
@@ -59,7 +60,7 @@ void float_type_declared(const CXType &field_type) {
     declared_types[field_type] = value;
 }
 
-void remove_type_declaration(const CXType& field_type) {
+void remove_type_declaration(const CXType &field_type) {
     declared_types.erase(field_type);
 }
 
@@ -149,50 +150,99 @@ RETURN_SPELLING:
 
 CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _2) {
     auto handle_container_decl = [](const CXCursor &target_cursor, const json_category cat) {
-        nlohmann::json struct_decl;
+        if (cat == FUNCTION_TYPE) {
+            nlohmann::json function_info;
 
-        const CXType structure_type = clang_getCursorType(target_cursor);
-        if (clang_equalCursors(clang_getCursorDefinition(target_cursor), clang_getNullCursor()) ||
-            type_declared(structure_type))
-            return;
+            const CXType function_type = clang_getCursorType(target_cursor);
 
-        std::string type_name;
-        const auto spelling = clang_getTypeSpelling(structure_type);
-        if (clang_Cursor_isAnonymousRecordDecl(target_cursor) || clang_Cursor_isAnonymous(target_cursor)) {
-            if (!try_get_anon_name(structure_type))
-                create_anon_type_name(structure_type);
+            // rettype
+            const CXType return_type = clang_getResultType(function_type);
+            function_info["rettype"] = normalize_field_type_name(return_type);
 
-            type_name = try_get_anon_name(structure_type);
+            // name
+            std::string type_name;
+            const auto spelling = clang_getTypeSpelling(function_type);
+            if (clang_Cursor_isAnonymousRecordDecl(target_cursor) || clang_Cursor_isAnonymous(target_cursor)) {
+                if (!try_get_anon_name(function_type))
+                    create_anon_type_name(function_type);
+
+                type_name = try_get_anon_name(function_type);
+            } else {
+                type_name = std::string(clang_getCString(spelling));
+            }
+
+            function_info["name"] = type_name;
+
+            // callconv
+            switch (clang_getFunctionTypeCallingConv(function_type)) {
+                case CXCallingConv_C:
+                    function_info["callconv"] = "cdecl";
+                    break;
+                case CXCallingConv_X86StdCall:
+                    function_info["callconv"] = "stdcall";
+                    break;
+                case CXCallingConv_X86FastCall:
+                case CXCallingConv_X86ThisCall:
+                case CXCallingConv_X86RegCall:
+                case CXCallingConv_X86_64Win64:
+                case CXCallingConv_X86_64SysV:
+                case CXCallingConv_X86VectorCall:
+                    function_info["callconv"] = "fastcall";
+                    break;
+            }
+
+            // noreturn
+            // this is definitely no true but we can ignore this for now
+            function_info["noreturn"] = false;
+
+            // args
+            clang_visitChildren(target_cursor, visit_cursor, nullptr);
         } else {
-            type_name = std::string(clang_getCString(spelling));
+            nlohmann::json struct_decl;
+
+            const CXType structure_type = clang_getCursorType(target_cursor);
+            if (clang_equalCursors(clang_getCursorDefinition(target_cursor), clang_getNullCursor()) ||
+                type_declared(structure_type))
+                return;
+
+            std::string type_name;
+            const auto spelling = clang_getTypeSpelling(structure_type);
+            if (clang_Cursor_isAnonymousRecordDecl(target_cursor) || clang_Cursor_isAnonymous(target_cursor)) {
+                if (!try_get_anon_name(structure_type))
+                    create_anon_type_name(structure_type);
+
+                type_name = try_get_anon_name(structure_type);
+            } else {
+                type_name = std::string(clang_getCString(spelling));
+            }
+
+            struct_decl["name"] = type_name;
+            struct_decl["members"] = {};
+
+            // if (type_name == "_RTL_BALANCED_NODE")
+            //     __debugbreak();
+
+            if (cat == UNION_TYPE)
+                struct_decl["isUnion"] = true;
+
+            if (cat == ENUM_TYPE) {
+                const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
+                auto size = clang_Type_getSizeOf(underlying_type) * 8;
+
+                struct_decl["size"] = size;
+                struct_decl["isBitField"] = true;
+            }
+
+            insert_type_declared(structure_type, struct_decl, cat);
+            clang_visitChildren(target_cursor, visit_cursor, nullptr);
+
+            if (!get_type_json(structure_type)["members"].empty())
+                float_type_declared(structure_type);
+            else
+                remove_type_declaration(structure_type);
+
+            clang_disposeString(spelling);
         }
-
-        struct_decl["name"] = type_name;
-        struct_decl["members"] = {};
-
-        // if (type_name == "_RTL_BALANCED_NODE")
-        //     __debugbreak();
-
-        if (cat == UNION_TYPE)
-            struct_decl["isUnion"] = true;
-
-        if (cat == ENUM_TYPE) {
-            const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
-            auto size = clang_Type_getSizeOf(underlying_type) * 8;
-
-            struct_decl["size"] = size;
-            struct_decl["isBitField"] = true;
-        }
-
-        insert_type_declared(structure_type, struct_decl, cat);
-        clang_visitChildren(target_cursor, visit_cursor, nullptr);
-
-        if (!get_type_json(structure_type)["members"].empty())
-            float_type_declared(structure_type);
-        else
-            remove_type_declaration(structure_type);
-
-        clang_disposeString(spelling);
     };
 
     switch (const auto cursor_kind = clang_getCursorKind(cursor)) {
@@ -204,6 +254,9 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
             return CXChildVisit_Continue;
         case CXCursor_EnumDecl:
             handle_container_decl(cursor, ENUM_TYPE);
+            return CXChildVisit_Continue;
+        case CXCursor_FunctionDecl:
+            handle_container_decl(cursor, FUNCTION_TYPE);
             return CXChildVisit_Continue;
 
         case CXCursor_EnumConstantDecl: {
@@ -283,8 +336,8 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData _
             }
 
             clang_disposeString(typedef_name);
+            break;
         }
-
         case CXCursor_ClassTemplate: {
             // return CXChildVisit_Continue;
         }
@@ -379,6 +432,7 @@ int main(const int argc, char **argv) {
     root_type_object["unions"] = {};
     root_type_object["types"] = {};
     root_type_object["enums"] = {};
+    root_type_object["functions"] = {};
 
     for (auto &val: declared_types | std::views::values) {
         auto &[body, type] = val;
@@ -392,6 +446,9 @@ int main(const int argc, char **argv) {
                 break;
             case TYPEDEF_TYPE:
                 root_type_object["types"].push_back(body);
+                break;
+            case FUNCTION_TYPE:
+                root_type_object["functions"].push_back(body);
                 break;
         }
     }
