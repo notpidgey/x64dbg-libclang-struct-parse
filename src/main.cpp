@@ -109,7 +109,7 @@ nlohmann::json &get_type_json(const CXType &type) {
 
 // removed the prefix "struct", "union", "enum", and "class"
 // also gives anonymous name to field types
-std::string normalize_field_type_name(const CXType &type,
+std::string normalize_type_name(const CXType &type,
                                       const uint32_t pointer_level = 0) {
     auto current_type = type;
     if (current_type.kind == CXType_ConstantArray ||
@@ -123,7 +123,7 @@ std::string normalize_field_type_name(const CXType &type,
     if (current_type.kind == CXType_Pointer) {
         const CXType next_type = clang_getPointeeType(current_type);
         if (next_type.kind != CXType_Invalid) {
-            return normalize_field_type_name(next_type, pointer_level + 1);
+            return normalize_type_name(next_type, pointer_level + 1);
         }
     }
 
@@ -172,16 +172,13 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         if (clang_Cursor_isAnonymousRecordDecl(target_cursor) ||
             clang_Cursor_isAnonymous(target_cursor)) {
             // is anonynmous
-            if (!try_get_anon_name(structure_type))
-                create_anon_type_name(structure_type);
+            type_name = normalize_type_name(structure_type);
 
-            type_name = try_get_anon_name(structure_type);
-
-            auto parent_cursor = clang_getCursorSemanticParent(target_cursor);
-            if (!clang_Cursor_isNull(parent_cursor)) {
+            const auto parent_cursor = clang_getCursorSemanticParent(
+                target_cursor);
+            if (!clang_Cursor_isNull(parent_cursor) &&
+                clang_Cursor_isAnonymous(target_cursor)) {
                 const CXType parent_type = clang_getCursorType(parent_cursor);
-                assert(type_declared(parent_type),
-                       "parent type must be declared");
 
                 nlohmann::json &parent_structure = get_type_json(parent_type);
                 auto &members = parent_structure["members"];
@@ -189,26 +186,25 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
                 nlohmann::json member_info = {};
                 member_info["name"] = type_name;
 
-                if (!parent_structure.contains("isUnion")) {
-                    const auto bit_offset = clang_Cursor_getOffsetOfField(
-                        parent_cursor);
-                    member_info["offset"] = bit_offset / 8;
+                long long expected_offset = 0;
+                if (!members.empty()) {
+                    auto &back = members.back();
 
-                    if (clang_Cursor_isBitField(parent_cursor)) {
-                        member_info["bitOffset"] = bit_offset % 8;
-                        member_info["bitSize"] = clang_getFieldDeclBitWidth(
-                            parent_cursor);
-                    }
+                    const auto bit_size = back["bitSize"].get<long long>();
+                    const auto offset = back["offset"].get<long long>();
+
+                    auto bit_alignment = clang_Type_getAlignOf(parent_type) * 8;
+                    auto bit_offset = offset * 8;
+
+                    expected_offset =
+                        (bit_offset + bit_size + bit_alignment - 1) /
+                        (bit_alignment) * 8;
                 }
 
-                const CXType field_type = clang_getCursorType(parent_cursor);
-                if (field_type.kind == CXType_ConstantArray) {
-                    member_info["type"] = normalize_field_type_name(
-                        clang_getArrayElementType(field_type));
-                    member_info["arrsize"] = clang_getArraySize(field_type);
-                } else {
-                    member_info["type"] = normalize_field_type_name(field_type);
-                }
+                member_info["bitSize"] =
+                    clang_Type_getSizeOf(structure_type) * 8;
+                member_info["offset"] = expected_offset;
+                member_info["type"] = type_name;
 
                 members.push_back(member_info);
             }
@@ -304,23 +300,23 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         nlohmann::json member_info = {};
         member_info["name"] = clang_getCString(name);
 
-        if (!parent_structure.contains("isUnion")) {
-            const auto bit_offset = clang_Cursor_getOffsetOfField(cursor);
-            member_info["offset"] = bit_offset / 8;
-
-            if (clang_Cursor_isBitField(cursor)) {
-                member_info["bitOffset"] = bit_offset % 8;
-                member_info["bitSize"] = clang_getFieldDeclBitWidth(cursor);
-            }
-        }
+        const auto bit_offset = clang_Cursor_getOffsetOfField(cursor);
+        member_info["offset"] = bit_offset / 8;
 
         const CXType field_type = clang_getCursorType(cursor);
         if (field_type.kind == CXType_ConstantArray) {
-            member_info["type"] = normalize_field_type_name(
+            member_info["type"] = normalize_type_name(
                 clang_getArrayElementType(field_type));
             member_info["arrsize"] = clang_getArraySize(field_type);
         } else {
-            member_info["type"] = normalize_field_type_name(field_type);
+            member_info["type"] = normalize_type_name(field_type);
+        }
+
+        if (clang_Cursor_isBitField(cursor)) {
+            member_info["bitOffset"] = bit_offset % 8;
+            member_info["bitSize"] = clang_getFieldDeclBitWidth(cursor);
+        } else {
+            member_info["bitSize"] = clang_Type_getSizeOf(field_type) * 8;
         }
 
         members.push_back(member_info);
@@ -347,7 +343,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
                 nlohmann::json arg_info;
                 //arg_info["name"] = clang_getCString(name);
                 arg_info["name"] = "";
-                arg_info["type"] = normalize_field_type_name(arg);
+                arg_info["type"] = normalize_type_name(arg);
 
                 clang_disposeString(name);
 
@@ -355,7 +351,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             }
 
             const CXType return_type = clang_getResultType(underlying_type);
-            function_info["rettype"] = normalize_field_type_name(return_type);
+            function_info["rettype"] = normalize_type_name(return_type);
 
             function_info["name"] = clang_getCString(typedef_name);
 
@@ -387,7 +383,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         } else {
             // other
             auto name = clang_getCString(typedef_name);
-            auto type = normalize_field_type_name(underlying_type);
+            auto type = normalize_type_name(underlying_type);
 
             if (name != type) {
                 nlohmann::json type_info;
