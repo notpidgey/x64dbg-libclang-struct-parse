@@ -213,9 +213,6 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             type_name = std::string(clang_getCString(spelling));
         }
 
-        if (type_name == "_RTL_BALANCED_NODE")
-            __debugbreak();
-
         struct_decl["name"] = type_name;
         struct_decl["members"] = {};
 
@@ -316,7 +313,8 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             member_info["bitOffset"] = bit_offset % 8;
             member_info["bitSize"] = clang_getFieldDeclBitWidth(cursor);
         } else {
-            member_info["bitSize"] = clang_Type_getSizeOf(field_type) * 8;
+            auto t = clang_Type_getSizeOf(field_type);
+            member_info["bitSize"] = t * 8;
         }
 
         members.push_back(member_info);
