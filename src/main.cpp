@@ -16,12 +16,15 @@
 #include <clang-c/Index.h>
 #include <nlohmann/json.hpp>
 
+#define ALIGN_UP(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
+
 enum json_category {
     ENUM_TYPE = 0,
     STRUCT_TYPE = 1,
     UNION_TYPE = 2,
     TYPEDEF_TYPE = 3,
-    FUNCTION_TYPE = 4
+    FUNCTION_TYPE = 4,
+    CLASS_TYPE = 5
 };
 
 struct CXTypeHash {
@@ -41,18 +44,15 @@ struct CXTypeEqual {
 };
 
 uint32_t anonymous_type_counter = 0;
-std::unordered_map<CXType, std::string, CXTypeHash, CXTypeEqual>
-anonymous_type_map;
-
-tsl::ordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash,
-                 CXTypeEqual> declared_types;
+std::unordered_map<CXType, std::string, CXTypeHash, CXTypeEqual> anonymous_type_map;
+tsl::ordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash, CXTypeEqual>
+declared_types;
 
 bool type_declared(const CXType &field_type) {
     return declared_types.contains(field_type);
 }
 
-void insert_type_declared(const CXType &field_type, const nlohmann::json &json,
-                          json_category cat) {
+void insert_type_declared(const CXType &field_type, const nlohmann::json &json, json_category cat) {
     declared_types[field_type] = {json, cat};
 }
 
@@ -90,8 +90,8 @@ void create_anon_type_name(const CXType &str) {
         break;
     }
 
-    const auto anon_type_name = std::format("__anonymous_{}{}", prefix_name,
-                                            ++anonymous_type_counter);
+    const auto anon_type_name = std::format(
+        "__anonymous_{}{}", prefix_name, ++anonymous_type_counter);
     anonymous_type_map[str] = anon_type_name;
 }
 
@@ -109,8 +109,7 @@ nlohmann::json &get_type_json(const CXType &type) {
 
 // removed the prefix "struct", "union", "enum", and "class"
 // also gives anonymous name to field types
-std::string normalize_type_name(const CXType &type,
-                                      const uint32_t pointer_level = 0) {
+std::string normalize_type_name(const CXType &type, const uint32_t pointer_level = 0) {
     auto current_type = type;
     if (current_type.kind == CXType_ConstantArray ||
         current_type.kind == CXType_IncompleteArray ||
@@ -155,10 +154,8 @@ RETURN_SPELLING:
     return std::string(out_spelling) + std::string(pointer_level, '*');
 };
 
-CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
-                                CXClientData _2) {
-    auto handle_container_decl = [](const CXCursor &target_cursor,
-                                    const json_category cat) {
+CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) {
+    auto handle_container_decl = [](const CXCursor &target_cursor, const json_category cat) {
         nlohmann::json struct_decl;
 
         const CXType structure_type = clang_getCursorType(target_cursor);
@@ -174,10 +171,8 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             // is anonynmous
             type_name = normalize_type_name(structure_type);
 
-            const auto parent_cursor = clang_getCursorSemanticParent(
-                target_cursor);
-            if (!clang_Cursor_isNull(parent_cursor) &&
-                clang_Cursor_isAnonymous(target_cursor)) {
+            const auto parent_cursor = clang_getCursorSemanticParent(target_cursor);
+            if (!clang_Cursor_isNull(parent_cursor) && clang_Cursor_isAnonymous(target_cursor)) {
                 const CXType parent_type = clang_getCursorType(parent_cursor);
 
                 nlohmann::json &parent_structure = get_type_json(parent_type);
@@ -187,22 +182,23 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
                 member_info["name"] = type_name;
 
                 long long expected_offset = 0;
-                if (!members.empty()) {
-                    auto &back = members.back();
+                if (!parent_structure.contains("isUnion") || !parent_structure["isUnion"]) {
+                    if (!members.empty()) {
+                        auto &back = members.back();
 
-                    const auto bit_size = back["bitSize"].get<long long>();
-                    const auto offset = back["offset"].get<long long>();
+                        const auto bit_size = back["bitSize"].get<long long>();
+                        const auto prev_offset = back["offset"].get<long long>();
 
-                    auto bit_alignment = clang_Type_getAlignOf(parent_type) * 8;
-                    auto bit_offset = offset * 8;
-
-                    expected_offset =
-                        (bit_offset + bit_size + bit_alignment - 1) /
-                        (bit_alignment) * 8;
+                        const auto prev_end_offset = prev_offset + (bit_size + 7) / 8;
+                        const auto union_align = clang_Type_getAlignOf(structure_type);
+                        if (prev_end_offset % union_align == 0)
+                            expected_offset = prev_end_offset;
+                        else
+                            expected_offset = ALIGN_UP(prev_end_offset, union_align);
+                    }
                 }
 
-                member_info["bitSize"] =
-                    clang_Type_getSizeOf(structure_type) * 8;
+                member_info["bitSize"] = clang_Type_getSizeOf(structure_type) * 8;
                 member_info["offset"] = expected_offset;
                 member_info["type"] = type_name;
 
@@ -216,33 +212,36 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         struct_decl["name"] = type_name;
         struct_decl["members"] = {};
 
-        // if (type_name == "_RTL_BALANCED_NODE")
-        //     __debugbreak();
-
         if (cat == UNION_TYPE)
             struct_decl["isUnion"] = true;
 
         if (cat == ENUM_TYPE) {
-            const auto underlying_type = clang_getEnumDeclIntegerType(
-                target_cursor);
-            auto size = clang_Type_getSizeOf(underlying_type) * 8;
-
-            struct_decl["size"] = size;
-            struct_decl["isBitField"] = true;
+            // set enum size
+            const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
+            struct_decl["size"] = clang_Type_getSizeOf(underlying_type);
+            struct_decl["isFlags"] = true;
+        } else {
+            // set default size
+            struct_decl["size"] = clang_Type_getSizeOf(structure_type);
         }
 
-        insert_type_declared(structure_type, struct_decl, cat);
-        clang_visitChildren(target_cursor, visit_cursor, nullptr);
+        // insert classes as structures
+        insert_type_declared(structure_type, struct_decl, cat == CLASS_TYPE ? STRUCT_TYPE : cat);
 
-        if (!get_type_json(structure_type)["members"].empty())
-            float_type_declared(structure_type);
-        else
-            remove_type_declaration(structure_type);
+        // we do not want to visit classes
+        if (cat != CLASS_TYPE) {
+            clang_visitChildren(target_cursor, visit_cursor, nullptr);
+
+            if (!get_type_json(structure_type)["members"].empty())
+                float_type_declared(structure_type);
+            else
+                remove_type_declaration(structure_type);
+        }
 
         clang_disposeString(spelling);
     };
 
-    switch (const auto cursor_kind = clang_getCursorKind(cursor)) {
+    switch (clang_getCursorKind(cursor)) {
     case CXCursor_StructDecl:
         handle_container_decl(cursor, STRUCT_TYPE);
         return CXChildVisit_Continue;
@@ -254,6 +253,9 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         return CXChildVisit_Continue;
     case CXCursor_FunctionDecl:
         handle_container_decl(cursor, FUNCTION_TYPE);
+        return CXChildVisit_Continue;
+    case CXCursor_ClassDecl:
+        handle_container_decl(cursor, CLASS_TYPE);
         return CXChildVisit_Continue;
 
     case CXCursor_EnumConstantDecl: {
@@ -280,10 +282,9 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
     case CXCursor_FieldDecl: {
         const CXCursorKind parent_kind = clang_getCursorKind(parent);
         assert(
-            parent_kind == CXCursor_StructDecl || parent_kind ==
-            CXCursor_ClassDecl
-            || parent_kind ==
-            CXCursor_UnionDecl,
+            parent_kind == CXCursor_StructDecl ||
+            parent_kind == CXCursor_ClassDecl ||
+            parent_kind == CXCursor_UnionDecl,
             "parent is not struct/class declaration");
 
         const CXType parent_type = clang_getCursorType(parent);
@@ -293,8 +294,9 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
         nlohmann::json &parent_structure = get_type_json(parent_type);
         auto &members = parent_structure["members"];
 
-        const CXString name = clang_getCursorSpelling(cursor);
         nlohmann::json member_info = {};
+
+        const CXString name = clang_getCursorSpelling(cursor);
         member_info["name"] = clang_getCString(name);
 
         const auto bit_offset = clang_Cursor_getOffsetOfField(cursor);
@@ -302,19 +304,64 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
 
         const CXType field_type = clang_getCursorType(cursor);
         if (field_type.kind == CXType_ConstantArray) {
-            member_info["type"] = normalize_type_name(
-                clang_getArrayElementType(field_type));
-            member_info["arrsize"] = clang_getArraySize(field_type);
+            long long element_count = 1;
+
+            auto current_array_type = field_type;
+            while (current_array_type.kind == CXType_ConstantArray) {
+                long long size = clang_getArraySize(current_array_type);
+                assert(size > 0, "array size must be positive");
+
+                element_count *= size;
+                current_array_type = clang_getArrayElementType(current_array_type);
+            }
+
+            member_info["type"] = normalize_type_name(clang_getArrayElementType(field_type));
+            member_info["arrsize"] = element_count;
         } else {
-            member_info["type"] = normalize_type_name(field_type);
+            bool is_fun_pointer = false;
+            if (field_type.kind == CXType_Pointer) {
+                // check if function proto
+                auto curr_type = field_type;
+                while (curr_type.kind == CXType_Pointer)
+                    curr_type = clang_getPointeeType(curr_type);
+
+                if (curr_type.kind == CXType_FunctionProto ||
+                    curr_type.kind == CXType_FunctionNoProto) {
+                    is_fun_pointer = true;
+                }
+            }
+
+            if (is_fun_pointer)
+                member_info["type"] = "void*";
+            else
+                member_info["type"] = normalize_type_name(field_type);
         }
 
         if (clang_Cursor_isBitField(cursor)) {
             member_info["bitOffset"] = bit_offset % 8;
             member_info["bitSize"] = clang_getFieldDeclBitWidth(cursor);
+            member_info["bitfield"] = true;
         } else {
-            auto t = clang_Type_getSizeOf(field_type);
-            member_info["bitSize"] = t * 8;
+            member_info["bitSize"] = clang_Type_getSizeOf(field_type) * 8;
+        }
+
+        // todo clean up so not checking json fields and actual values instead
+        // check if back element is of same type and same offset
+        if (!members.empty()) {
+            auto &back = members.back();
+
+            bool similar_field = back["type"] == member_info["type"] &&
+                                 back["offset"] == member_info["offset"];
+            if (similar_field) {
+                if (back.contains("bitOffset") == member_info.contains("bitOffset")) {
+                    if (!back.contains("bitOffset") ||
+                        back["bitOffset"] == member_info["bitOffset"]) {
+                        back["name"] = member_info["name"];
+                        clang_disposeString(name);
+                        break;
+                    }
+                }
+            }
         }
 
         members.push_back(member_info);
@@ -323,11 +370,23 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
     }
     case CXCursor_TypedefDecl: {
         const CXString typedef_name = clang_getCursorSpelling(cursor);
-        const CXType underlying_type = clang_getTypedefDeclUnderlyingType(
-            cursor);
+        const CXType underlying_type = clang_getTypedefDeclUnderlyingType(cursor);
 
-        if (underlying_type.kind == CXType_FunctionProto ||
-            underlying_type.kind == CXType_FunctionNoProto) {
+        bool is_fun_pointer = false;
+        if (underlying_type.kind == CXType_Pointer) {
+            // check if function proto
+            auto curr_type = underlying_type;
+            while (curr_type.kind == CXType_Pointer)
+                curr_type = clang_getPointeeType(curr_type);
+
+            if (curr_type.kind == CXType_FunctionProto || curr_type.kind ==
+                CXType_FunctionNoProto) {
+                is_fun_pointer = true;
+            }
+        }
+
+        if (underlying_type.kind == CXType_FunctionProto || underlying_type.kind ==
+            CXType_FunctionNoProto) {
             // function type
             nlohmann::json function_info;
             function_info["args"] = {};
@@ -335,8 +394,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             auto arg_count = clang_getNumArgTypes(underlying_type);
             for (auto i = 0; i < arg_count; i++) {
                 auto arg = clang_getArgType(underlying_type, i);
-                auto name = clang_getCursorSpelling(
-                    clang_getTypeDeclaration(arg));
+                auto name = clang_getCursorSpelling(clang_getTypeDeclaration(arg));
 
                 nlohmann::json arg_info;
                 //arg_info["name"] = clang_getCString(name);
@@ -350,7 +408,6 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
 
             const CXType return_type = clang_getResultType(underlying_type);
             function_info["rettype"] = normalize_type_name(return_type);
-
             function_info["name"] = clang_getCString(typedef_name);
 
             // callconv
@@ -376,8 +433,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             // this is definitely no true but we can ignore this for now
             // function_info["noreturn"] = false;
 
-            insert_type_declared(clang_getCursorType(cursor), function_info,
-                                 FUNCTION_TYPE);
+            insert_type_declared(clang_getCursorType(cursor), function_info, FUNCTION_TYPE);
         } else {
             // other
             auto name = clang_getCString(typedef_name);
@@ -386,18 +442,18 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent,
             if (name != type) {
                 nlohmann::json type_info;
                 type_info["name"] = name;
-                type_info["type"] = type;
 
-                insert_type_declared(clang_getCursorType(cursor), type_info,
-                                     TYPEDEF_TYPE);
+                if (is_fun_pointer)
+                    type_info["type"] = "void*";
+                else
+                    type_info["type"] = type;
+
+                insert_type_declared(clang_getCursorType(cursor), type_info, TYPEDEF_TYPE);
             }
         }
 
         clang_disposeString(typedef_name);
         break;
-    }
-    case CXCursor_ClassTemplate: {
-        // return CXChildVisit_Continue;
     }
     }
 
@@ -490,10 +546,9 @@ int main(const int argc, char **argv) {
     // };
 
     nlohmann::json root_type_object;
-    root_type_object["structs"] = {};
-    root_type_object["unions"] = {};
-    root_type_object["types"] = {};
     root_type_object["enums"] = {};
+    root_type_object["structUnions"] = {};
+    root_type_object["types"] = {};
     root_type_object["functions"] = {};
 
     for (auto &val : declared_types | std::views::values) {
