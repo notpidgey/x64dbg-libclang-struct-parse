@@ -454,7 +454,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
             auto name = clang_getCString(typedef_name);
             auto type = normalize_type_name(underlying_type);
 
-            const std::initializer_list<std::string> ignored_types = {"__C_ASSERT__", "type"};
+            const std::initializer_list<std::string> ignored_types = {"__C_ASSERT__", "type", "_Type", "nullptr_t"};
             if (std::ranges::find(ignored_types, std::string(name)) == ignored_types.end() && name != type) {
                 nlohmann::json type_info;
                 type_info["name"] = name;
