@@ -23,8 +23,7 @@ enum json_category {
     STRUCT_TYPE = 1,
     UNION_TYPE = 2,
     TYPEDEF_TYPE = 3,
-    FUNCTION_TYPE = 4,
-    CLASS_TYPE = 5
+    FUNCTION_TYPE = 4
 };
 
 struct CXTypeHash {
@@ -110,7 +109,7 @@ nlohmann::json &get_type_json(const CXType &type) {
 // removed the prefix "struct", "union", "enum", and "class"
 // also gives anonymous name to field types
 std::string normalize_type_name(const CXType &type, const uint32_t pointer_level = 0) {
-    auto current_type = type;
+    auto current_type = clang_getUnqualifiedType(type);
     if (current_type.kind == CXType_ConstantArray ||
         current_type.kind == CXType_IncompleteArray ||
         current_type.kind == CXType_VariableArray) {
@@ -158,11 +157,20 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
     auto handle_container_decl = [](const CXCursor &target_cursor, const json_category cat) {
         nlohmann::json struct_decl;
 
+        bool is_forward_declared = clang_equalCursors(clang_getCursorDefinition(target_cursor),
+                                                      clang_getNullCursor());
+
         const CXType structure_type = clang_getCursorType(target_cursor);
-        if (clang_equalCursors(clang_getCursorDefinition(target_cursor),
-                               clang_getNullCursor()) ||
-            type_declared(structure_type))
-            return;
+        if (type_declared(structure_type)) {
+            // check if previously declared structure is empty
+            nlohmann::json &previous_decl = get_type_json(structure_type);
+            if (previous_decl["size"] != 0) {
+                // skip redefinition
+                return;
+            }
+
+            struct_decl = previous_decl;
+        }
 
         std::string type_name;
         const auto spelling = clang_getTypeSpelling(structure_type);
@@ -210,7 +218,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         }
 
         struct_decl["name"] = type_name;
-        struct_decl["members"] = {};
+        struct_decl["members"] = nlohmann::json::array();
 
         if (cat == UNION_TYPE)
             struct_decl["isUnion"] = true;
@@ -218,25 +226,19 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         if (cat == ENUM_TYPE) {
             // set enum size
             const auto underlying_type = clang_getEnumDeclIntegerType(target_cursor);
-            struct_decl["size"] = clang_Type_getSizeOf(underlying_type);
+            struct_decl["size"] = is_forward_declared ? 0 : clang_Type_getSizeOf(underlying_type);
             struct_decl["isFlags"] = true;
         } else {
             // set default size
-            struct_decl["size"] = clang_Type_getSizeOf(structure_type);
+            struct_decl["size"] = is_forward_declared ? 0 : clang_Type_getSizeOf(structure_type);
         }
 
         // insert classes as structures
-        insert_type_declared(structure_type, struct_decl, cat == CLASS_TYPE ? STRUCT_TYPE : cat);
+        insert_type_declared(structure_type, struct_decl, cat);
 
         // we do not want to visit classes
-        if (cat != CLASS_TYPE) {
-            clang_visitChildren(target_cursor, visit_cursor, nullptr);
-
-            if (!get_type_json(structure_type)["members"].empty())
-                float_type_declared(structure_type);
-            else
-                remove_type_declaration(structure_type);
-        }
+        clang_visitChildren(target_cursor, visit_cursor, nullptr);
+        float_type_declared(structure_type);
 
         clang_disposeString(spelling);
     };
@@ -255,7 +257,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         handle_container_decl(cursor, FUNCTION_TYPE);
         return CXChildVisit_Continue;
     case CXCursor_ClassDecl:
-        handle_container_decl(cursor, CLASS_TYPE);
+        handle_container_decl(cursor, STRUCT_TYPE);
         return CXChildVisit_Continue;
 
     case CXCursor_EnumConstantDecl: {
@@ -303,13 +305,13 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         member_info["offset"] = bit_offset / 8;
 
         const CXType field_type = clang_getCursorType(cursor);
-        if (field_type.kind == CXType_ConstantArray) {
-            long long element_count = 1;
 
+        long long element_count = 1;
+        if (field_type.kind == CXType_ConstantArray) {
             auto current_array_type = field_type;
             while (current_array_type.kind == CXType_ConstantArray) {
                 long long size = clang_getArraySize(current_array_type);
-                assert(size > 0, "array size must be positive");
+                assert(size >= 0, "array size must be positive");
 
                 element_count *= size;
                 current_array_type = clang_getArrayElementType(current_array_type);
@@ -345,6 +347,16 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
             member_info["bitSize"] = clang_Type_getSizeOf(field_type) * 8;
         }
 
+        // todo correct way to do this would be checking the attributes
+        // make sure its not a __ptr32
+        if (member_info["type"] == "void*") {
+
+            auto ptr_bit_size = member_info["bitSize"].get<long long>() / element_count;
+            if (ptr_bit_size == 32) {
+                member_info["type"] = "unsigned int";
+            }
+        }
+
         // todo clean up so not checking json fields and actual values instead
         // check if back element is of same type and same offset
         if (!members.empty()) {
@@ -369,24 +381,27 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         break;
     }
     case CXCursor_TypedefDecl: {
-        const CXString typedef_name = clang_getCursorSpelling(cursor);
         const CXType underlying_type = clang_getTypedefDeclUnderlyingType(cursor);
+        if (type_declared(clang_getCursorType(cursor)))
+            break;
 
         bool is_fun_pointer = false;
+
+        const CXString typedef_name = clang_getCursorSpelling(cursor);
         if (underlying_type.kind == CXType_Pointer) {
             // check if function proto
             auto curr_type = underlying_type;
             while (curr_type.kind == CXType_Pointer)
                 curr_type = clang_getPointeeType(curr_type);
 
-            if (curr_type.kind == CXType_FunctionProto || curr_type.kind ==
-                CXType_FunctionNoProto) {
+            if (curr_type.kind == CXType_FunctionProto ||
+                curr_type.kind == CXType_FunctionNoProto) {
                 is_fun_pointer = true;
             }
         }
 
-        if (underlying_type.kind == CXType_FunctionProto || underlying_type.kind ==
-            CXType_FunctionNoProto) {
+        if (underlying_type.kind == CXType_FunctionProto ||
+            underlying_type.kind == CXType_FunctionNoProto) {
             // function type
             nlohmann::json function_info;
             function_info["args"] = {};
@@ -439,7 +454,8 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
             auto name = clang_getCString(typedef_name);
             auto type = normalize_type_name(underlying_type);
 
-            if (name != type) {
+            const std::initializer_list<std::string> ignored_types = {"__C_ASSERT__", "type"};
+            if (std::ranges::find(ignored_types, std::string(name)) == ignored_types.end() && name != type) {
                 nlohmann::json type_info;
                 type_info["name"] = name;
 
@@ -448,7 +464,16 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
                 else
                     type_info["type"] = type;
 
-                insert_type_declared(clang_getCursorType(cursor), type_info, TYPEDEF_TYPE);
+                static std::unordered_map<std::string, std::string> defined_types = {};
+                if (defined_types.contains(type_info["name"])) {
+                    // repeating typedef, not going to insert
+                    // auto &prev_type = defined_types[type_info["name"]];
+                    // auto curr_type = type_info["type"].get<std::string>();
+                    // assert(prev_type == curr_type, "repeating typedef with different type");
+                } else {
+                    insert_type_declared(clang_getCursorType(cursor), type_info, TYPEDEF_TYPE);
+                    defined_types[type_info["name"]] = type_info["type"];
+                }
             }
         }
 
