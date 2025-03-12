@@ -46,6 +46,7 @@ uint32_t anonymous_type_counter = 0;
 std::unordered_map<CXType, std::string, CXTypeHash, CXTypeEqual> anonymous_type_map;
 tsl::ordered_map<CXType, std::pair<nlohmann::json, json_category>, CXTypeHash, CXTypeEqual>
 declared_types;
+std::unordered_map<std::string, std::string> typedef_defined_types;
 
 bool type_declared(const CXType &field_type) {
     return declared_types.contains(field_type);
@@ -163,7 +164,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         if (type_declared(structure_type)) {
             // check if previously declared structure is empty
             nlohmann::json &previous_decl = get_type_json(structure_type);
-            if (previous_decl["size"] != 0 && !struct_decl["members"].empty()) {
+            if (previous_decl["size"] != 0 && !previous_decl["members"].empty()) {
                 // skip redefinition
                 return;
             }
@@ -251,9 +252,6 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         return CXChildVisit_Continue;
     case CXCursor_EnumDecl:
         handle_container_decl(cursor, ENUM_TYPE);
-        return CXChildVisit_Continue;
-    case CXCursor_FunctionDecl:
-        handle_container_decl(cursor, FUNCTION_TYPE);
         return CXChildVisit_Continue;
     case CXCursor_ClassDecl:
         handle_container_decl(cursor, STRUCT_TYPE);
@@ -463,15 +461,14 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
                 else
                     type_info["type"] = type;
 
-                static std::unordered_map<std::string, std::string> defined_types = {};
-                if (defined_types.contains(type_info["name"])) {
+                if (typedef_defined_types.contains(type_info["name"])) {
                     // repeating typedef, not going to insert
                     // auto &prev_type = defined_types[type_info["name"]];
                     // auto curr_type = type_info["type"].get<std::string>();
                     // assert(prev_type == curr_type, "repeating typedef with different type");
                 } else {
                     insert_type_declared(clang_getCursorType(cursor), type_info, TYPEDEF_TYPE);
-                    defined_types[type_info["name"]] = type_info["type"];
+                    typedef_defined_types[type_info["name"]] = type_info["type"];
                 }
             }
         }
@@ -484,7 +481,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
     return CXChildVisit_Recurse;
 }
 
-int generateHeader(const char *target_arg, const char *output_header, const char *stub_source) {
+int generate_header(const char *target_arg, const char *output_header, const char *stub_source) {
     // setup arguments
     std::vector<std::string> clang_args =
     {
@@ -558,8 +555,9 @@ int generateHeader(const char *target_arg, const char *output_header, const char
     out << root_type_object.dump(4) << std::endl;
 
     anonymous_type_counter = 0;
-    anonymous_type_map = {};
-    declared_types = {};
+    anonymous_type_map.clear();
+    declared_types.clear();
+    typedef_defined_types.clear();
 
     return EXIT_SUCCESS;
 }
@@ -577,9 +575,9 @@ int main(const int argc, char **argv) {
 
     include_stub.close();
 
-    generateHeader("-target x86_64-windows-msvc", "x86_64-windows.json",
+    generate_header("-target x86_64-windows-msvc", "x86_64-windows.json",
                    stub_source.string().c_str());
-    generateHeader("-target x86-windows-msvc", "x86-windows.json",
+    generate_header("-target x86-windows-msvc", "x86-windows.json",
                    stub_source.string().c_str());
 
     return EXIT_SUCCESS;
