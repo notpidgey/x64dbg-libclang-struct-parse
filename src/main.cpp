@@ -565,10 +565,8 @@ int generateHeader(const char *target_arg, const char *output_header, const char
 }
 
 int main(const int argc, char **argv) {
-    // setup stub file
     const std::filesystem::path current_path = std::filesystem::current_path();
-    const auto stub_source = current_path / "stub_include.cpp";
-
+    const std::filesystem::path stub_source = current_path / "stub_include.cpp";
     const std::vector<std::string> target_headers = {
         "phnt.h"
     };
@@ -581,7 +579,8 @@ int main(const int argc, char **argv) {
 
     generateHeader("-target x86_64-windows-msvc", "x86_64-windows.json",
                    stub_source.string().c_str());
-    generateHeader("-target x86-windows-msvc", "x86-windows.json", stub_source.string().c_str());
+    generateHeader("-target x86-windows-msvc", "x86-windows.json",
+                   stub_source.string().c_str());
 
     return EXIT_SUCCESS;
 }
