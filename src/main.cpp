@@ -89,8 +89,7 @@ void create_anon_type_name(const CXType &str) {
         break;
     }
 
-    const auto anon_type_name = std::format(
-        "__anonymous_{}{}", prefix_name, ++anonymous_type_counter);
+    const auto anon_type_name = std::format("__anon_{}{}", prefix_name, ++anonymous_type_counter);
     anonymous_type_map[str] = anon_type_name;
 }
 
@@ -164,7 +163,7 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         if (type_declared(structure_type)) {
             // check if previously declared structure is empty
             nlohmann::json &previous_decl = get_type_json(structure_type);
-            if (previous_decl["size"] != 0) {
+            if (previous_decl["size"] != 0 && !struct_decl["members"].empty()) {
                 // skip redefinition
                 return;
             }
@@ -267,7 +266,6 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
 
         const CXType parent_type = clang_getCursorType(parent);
         nlohmann::json &parent_enum = get_type_json(parent_type);
-
         nlohmann::json &members = parent_enum["members"];
 
         const CXString name = clang_getCursorSpelling(cursor);
@@ -350,7 +348,6 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
         // todo correct way to do this would be checking the attributes
         // make sure its not a __ptr32
         if (member_info["type"] == "void*") {
-
             auto ptr_bit_size = member_info["bitSize"].get<long long>() / element_count;
             if (ptr_bit_size == 32) {
                 member_info["type"] = "unsigned int";
@@ -454,8 +451,10 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
             auto name = clang_getCString(typedef_name);
             auto type = normalize_type_name(underlying_type);
 
-            const std::initializer_list<std::string> ignored_types = {"__C_ASSERT__", "type", "_Type", "nullptr_t"};
-            if (std::ranges::find(ignored_types, std::string(name)) == ignored_types.end() && name != type) {
+            const std::initializer_list<std::string> ignored_types = {
+                "__C_ASSERT__", "type", "_Type", "nullptr_t"};
+            if (std::ranges::find(ignored_types, std::string(name)) == ignored_types.end() && name
+                != type) {
                 nlohmann::json type_info;
                 type_info["name"] = name;
 
@@ -485,49 +484,30 @@ CXChildVisitResult visit_cursor(CXCursor cursor, CXCursor parent, CXClientData) 
     return CXChildVisit_Recurse;
 }
 
-int main(const int argc, char **argv) {
-    if (false) {
-        std::cout << "Target header paths has not been specified" << std::endl;
-        return -1;
-    }
-
-    // setup stub file
-    const std::filesystem::path current_path = std::filesystem::current_path();
-    const auto stub_source = current_path / "stub_include.cpp";
-
+int generateHeader(const char *target_arg, const char *output_header, const char *stub_source) {
     // setup arguments
-    const std::vector<std::string> clang_args =
+    std::vector<std::string> clang_args =
     {
         // "-I" + std::string(argv[1]),
         "-x",
         "c++",
-        "-target x86_64-windows-msvc",
         "-fms-extensions",
         "-Xclang",
         "-ast-dump",
         "-fsyntax-only",
-        "-fms-extensions"
+        "-fms-extensions",
+        target_arg
     };
 
     std::vector<const char *> c_args;
     for (const auto &arg : clang_args)
         c_args.push_back(arg.c_str());
 
-    const std::vector<std::string> target_headers = {
-        "phnt.h"
-    };
-
-    std::ofstream include_stub(stub_source, std::ios::out | std::ios::trunc);
-    for (auto &include : target_headers)
-        include_stub << std::format("#include <{}>\n", include);
-
-    include_stub.close();
-
     if (const auto index = clang_createIndex(0, 1)) {
         CXTranslationUnit tu = nullptr;
         const auto error = clang_parseTranslationUnit2(
             index,
-            stub_source.string().c_str(),
+            stub_source,
             c_args.data(),
             static_cast<int>(c_args.size()),
             nullptr,
@@ -548,27 +528,6 @@ int main(const int argc, char **argv) {
 
         clang_disposeTranslationUnit(tu);
     }
-
-    // std::vector<std::string> decl_order;
-    // std::unordered_map<std::string, std::pair<json_category, nlohmann::json *> > name_mapping;
-    //
-    // for (auto &val: declared_types | std::views::values) {
-    //     auto &[body, type] = val;
-    //     switch (type) {
-    //         case UNION_TYPE:
-    //         case STRUCT_TYPE:
-    //             name_mapping[body["name"]] = {type, &body};
-    //             break;
-    //     }
-    // }
-    //
-    // auto dfs = [](nlohmann::json *val) {
-    //     auto json_val = *val;
-    //     auto members = json_val["members"];
-    //
-    //     for (nlohmann::json member: members) {
-    //     }
-    // };
 
     nlohmann::json root_type_object;
     root_type_object["enums"] = {};
@@ -595,8 +554,34 @@ int main(const int argc, char **argv) {
         }
     }
 
-    std::ofstream out("windows_types_x64.json", std::ios::trunc);
+    std::ofstream out(output_header, std::ios::trunc);
     out << root_type_object.dump(4) << std::endl;
+
+    anonymous_type_counter = 0;
+    anonymous_type_map = {};
+    declared_types = {};
+
+    return EXIT_SUCCESS;
+}
+
+int main(const int argc, char **argv) {
+    // setup stub file
+    const std::filesystem::path current_path = std::filesystem::current_path();
+    const auto stub_source = current_path / "stub_include.cpp";
+
+    const std::vector<std::string> target_headers = {
+        "phnt.h"
+    };
+
+    std::ofstream include_stub(stub_source, std::ios::out | std::ios::trunc);
+    for (auto &include : target_headers)
+        include_stub << std::format("#include <{}>\n", include);
+
+    include_stub.close();
+
+    generateHeader("-target x86_64-windows-msvc", "x86_64-windows.json",
+                   stub_source.string().c_str());
+    generateHeader("-target x86-windows-msvc", "x86-windows.json", stub_source.string().c_str());
 
     return EXIT_SUCCESS;
 }
